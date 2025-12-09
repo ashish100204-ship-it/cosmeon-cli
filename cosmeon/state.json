@@ -1,0 +1,39 @@
+{
+  "nodes": {
+    "SAT-0": {
+      "node_id": "SAT-0",
+      "online": true,
+      "storage": {}
+    },
+    "SAT-1": {
+      "node_id": "SAT-1",
+      "online": true,
+      "storage": {}
+    },
+    "SAT-2": {
+      "node_id": "SAT-2",
+      "online": true,
+      "storage": {}
+    },
+    "SAT-3": {
+      "node_id": "SAT-3",
+      "online": true,
+      "storage": {}
+    },
+    "SAT-4": {
+      "node_id": "SAT-4",
+      "online": true,
+      "storage": {}
+    },
+    "SAT-5": {
+      "node_id": "SAT-5",
+      "online": true,
+      "storage": {}
+    }
+  },
+  "shard_map": {},
+  "file_meta": {},
+  "replication_factor": 2,
+  "group_size": 3,
+  "use_global_parity": true
+}
