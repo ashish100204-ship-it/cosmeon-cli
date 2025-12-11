@@ -1,20 +1,23 @@
-#!/usr/bin/env python3
-"""
-Final Interactive Prototype: Orbital Sharded Storage (OSS)
+"""PROBLEM STATEMENT 3: ORBITAL SHARDED STORAGE (OSS)
+Problem Summary
+Sharding is essential for COSMEON’s orbital data layer. This problem requires building a storage service that
+splits files into shards, distributes those shards across nodes, and reconstructs the file even if some shards are
+missing.
+Expectations
+Participants must implement sharding, shard distribution, and reconstruction logic in a multi-node simulated
+environment.
+Minimum Requirements
+• Split a file into N shards of equal or near-equal size.
+• Store shards on multiple simulated satellite nodes.
+• Maintain a shard map indicating which node stores which shard.
+• Reconstruct the original file when requested.
+• Demonstrate system behavior when certain shards or nodes are unavailable.
+• Implement basic error handling and validation during reconstruction.
+Optional Enhancements
+• Simple parity shards or Reed-Solomon style erasure coding.
+• Automatic shard healing when nodes rejoin.
+• Real-time visualization of shard distribution and node status."""
 
-This script implements a complete, interactive Command-Line Interface (CLI) for the
-OSS simulation using the Typer library. It allows a user to dynamically control
-the distributed storage system, including initialization, file distribution,
-reconstruction, and fault injection.
-
-The state of the system is persisted across commands via a JSON state file.
-
-Key Features:
-- Full CLI control over the simulation.
-- Real file input/output for distribution and reconstruction.
-- Persistent state management.
-- Implements an advanced, multi-layered fault-tolerance strategy (LRC).
-"""
 
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
@@ -25,10 +28,33 @@ import time
 import json
 import sys
 from pathlib import Path
-
 import typer
 
-# Attempt to import visualization libraries, setting a flag
+#  exception for reconstruction errors
+class ReconstructionError(Exception):
+    pass
+
+# Exception for missing shards
+class MissingShardsError(ReconstructionError):
+    def __init__(self, missing_indices: List[int], details: str = ""):
+        msg = f"Missing shards: {sorted(missing_indices)}"
+        if details:
+            msg += f" | Details: {details}"
+        super().__init__(msg)
+        self.missing = sorted(missing_indices)
+        self.details = details
+
+# Exception for corrupt shards
+class CorruptShardError(ReconstructionError):
+    def __init__(self, corrupt_list: List[Tuple[int, str]], details: str = ""):
+        msg = f"Corrupt shards found at: {corrupt_list}"
+        if details:
+            msg += f" | Details: {details}"
+        super().__init__(msg)
+        self.corrupt = corrupt_list
+        self.details = details
+
+# Optional visualization libraries
 try:
     import matplotlib.pyplot as plt
     import numpy as np
@@ -36,39 +62,38 @@ try:
 except ImportError:
     MATPLOTLIB_AVAILABLE = False
 
-
-# ---------- Data model ----------
-
+# Shard data structure with metadata
 @dataclass(frozen=True)
 class Shard:
-    """Represents a single chunk of a file, with metadata for reconstruction."""
     file_id: str
     shard_index: int
     total_shards: int
     data: bytes
     checksum: str
-    kind: str  # "data", "local_parity", or "global_parity"
-    group_id: Optional[int] = None  # Links local parity to its data group
+    kind: str
+    group_id: Optional[int] = None
 
+    # Create shard with checksum
     @staticmethod
     def make(file_id: str, shard_index: int, total_shards: int, data: bytes,
              kind: str = "data", group_id: Optional[int] = None) -> "Shard":
         checksum = hashlib.sha256(data).hexdigest()
         return Shard(file_id, shard_index, total_shards, data, checksum, kind, group_id)
 
+    # Serialize shard to dictionary
     def to_dict(self) -> Dict:
         return {"file_id": self.file_id, "shard_index": self.shard_index, "total_shards": self.total_shards,
                 "data": self.data.hex(), "checksum": self.checksum, "kind": self.kind, "group_id": self.group_id}
 
+    # Deserialize shard from dictionary
     @staticmethod
     def from_dict(d: Dict) -> "Shard":
         data = bytes.fromhex(d["data"])
         return Shard(d["file_id"], int(d["shard_index"]), int(d["total_shards"]), data,
                       d["checksum"], d["kind"], d.get("group_id"))
 
-
+# Satellite node simulation
 class Node:
-    """Simulates a single storage node (e.g., a satellite)."""
     def __init__(self, node_id: str):
         self.node_id = node_id
         self.online = True
@@ -103,14 +128,11 @@ class Node:
     def __repr__(self):
         return f"Node(id={self.node_id}, online={self.online}, shards={len(self.storage)})"
 
-
-# ---------- Manager ----------
-
+# Orchestrates sharding, distribution, and repair
 class ShardManager:
-    """Orchestrates the sharding, distribution, and repair of files."""
     def __init__(self, replication_factor: int = 2, group_size: int = 3, use_global_parity: bool = True):
         self.nodes: Dict[str, Node] = {}
-        self.shard_map: Dict[str, Dict[int, List[str]]] = {}
+        self.shard_map: Dict[str, Dict[str, List[str]]] = {}
         self.file_meta: Dict[str, Dict] = {}
         self.replication_factor = replication_factor
         self.group_size = group_size
@@ -126,6 +148,7 @@ class ShardManager:
         self.nodes[node_id].online = online
         self.logs.append(self._stamp(f"[NODE] {node_id} -> {'ONLINE' if online else 'OFFLINE'}"))
 
+    # Split file into equal/near-equal shards
     def _split_file(self, file_id: str, file_bytes: bytes, num_data_shards: int) -> List[Shard]:
         L = len(file_bytes)
         base, extra = divmod(L, num_data_shards)
@@ -137,6 +160,7 @@ class ShardManager:
             shards.append(Shard.make(file_id, i, num_data_shards, chunk, "data"))
         return shards
 
+    # XOR operation for parity calculation
     @staticmethod
     def _xor_bytes(buffers: List[bytes]) -> bytes:
         if not buffers: return b""
@@ -146,6 +170,7 @@ class ShardManager:
             for i, byte in enumerate(b): acc[i] ^= byte
         return bytes(acc)
 
+    # Create local parity shards for groups
     def _make_local_parities(self, file_id: str, data_shards: List[Shard], start_idx: int) -> List[Shard]:
         parities = []
         for gid, i in enumerate(range(0, len(data_shards), self.group_size)):
@@ -154,92 +179,195 @@ class ShardManager:
             parities.append(Shard.make(file_id, start_idx + gid, len(data_shards), parity_data, "local_parity", gid))
         return parities
 
+    # Create global parity shard
     def _make_global_parity(self, file_id: str, data_shards: List[Shard], shard_idx: int) -> Shard:
         gp_data = self._xor_bytes([s.data for s in data_shards])
         return Shard.make(file_id, shard_idx, len(data_shards), gp_data, "global_parity")
 
+    # Distribute file across nodes with replication
     def distribute_file(self, file_id: str, file_bytes: bytes, num_data_shards: int):
-        if not self.nodes: raise RuntimeError("No nodes available")
-        if file_id in self.shard_map: raise ValueError(f"File ID '{file_id}' already exists")
-        
+        if not self.nodes:
+            raise RuntimeError("No nodes available")
+        if file_id in self.shard_map:
+            raise ValueError(f"File ID '{file_id}' already exists")
+
+        if self.replication_factor > len(self.nodes):
+            raise ValueError(f"Replication factor ({self.replication_factor}) cannot exceed available nodes ({len(self.nodes)})")
+
+        # Create data and parity shards
         data_shards = self._split_file(file_id, file_bytes, num_data_shards)
         local_parities = self._make_local_parities(file_id, data_shards, len(data_shards))
         next_idx = len(data_shards) + len(local_parities)
         global_parity = self._make_global_parity(file_id, data_shards, next_idx) if self.use_global_parity else None
-        
-        all_shards = data_shards + local_parities + ([global_parity] if global_parity else [])
-        
-        self.shard_map[file_id] = {}
-        self.file_meta[file_id] = {"num_data": len(data_shards), "num_local_parity": len(local_parities),
-                                 "has_global_parity": bool(global_parity), "group_size": self.group_size}
 
+        all_shards = data_shards + local_parities + ([global_parity] if global_parity else [])
+
+        shard_sizes = [len(s.data) for s in data_shards]
+
+        # Store shard map and metadata
+        self.shard_map[file_id] = {}
+        self.file_meta[file_id] = {
+            "num_data": len(data_shards),
+            "num_local_parity": len(local_parities),
+            "has_global_parity": bool(global_parity),
+            "group_size": self.group_size,
+            "shard_sizes": shard_sizes,
+            "original_size": len(file_bytes),
+        }
+
+        # Round-robin distribution with replication
         node_ids = list(self.nodes.keys())
         rrs = [itertools.cycle(random.sample(node_ids, len(node_ids))) for _ in range(self.replication_factor)]
-        
+
+        # Place each shard on multiple nodes
         for shard in all_shards:
-            targets, chosen = [], set()
+            targets: List[str] = []
+            chosen = set()
             for rr in rrs:
-                node_id, attempts = next(rr), 0
+                attempts = 0
+                node_id = next(rr)
                 while node_id in chosen and attempts < len(node_ids):
                     node_id = next(rr)
                     attempts += 1
                 chosen.add(node_id)
+                targets.append(node_id)
                 self.nodes[node_id].store_shard(shard)
-            self.shard_map[file_id][shard.shard_index] = targets
 
-        self.logs.append(self._stamp(f"[DISTRIBUTE] File '{file_id}' created with {len(data_shards)} data, {len(local_parities)} local, {1 if global_parity else 0} global shards."))
+            self.shard_map[file_id][str(shard.shard_index)] = targets
 
+        self.logs.append(self._stamp(
+            f"[DISTRIBUTE] File '{file_id}' created with {len(data_shards)} data, {len(local_parities)} local, {1 if global_parity else 0} global shards."
+        ))
+
+    # Reconstruct file from shards with repair
     def reconstruct_file(self, file_id: str) -> bytes:
-        if file_id not in self.shard_map: raise KeyError(f"Unknown file_id: {file_id}")
-        
-        meta = self.file_meta[file_id]
-        num_data, group_size = meta["num_data"], meta["group_size"]
+        if file_id not in self.shard_map:
+            raise KeyError(f"Unknown file_id: {file_id}")
 
-        collected, missing, available_local, gp = {}, [], {}, None
+        meta = self.file_meta.get(file_id)
+        if not meta:
+            raise ReconstructionError(f"Missing metadata for file '{file_id}'")
+
+        num_data = int(meta.get("num_data", 0))
+        group_size = int(meta.get("group_size", 1))
+        shard_sizes = meta.get("shard_sizes")
+        original_size = meta.get("original_size")
+
+        collected: Dict[int, Shard] = {}
+        missing: List[int] = []
+        available_local: Dict[int, Shard] = {}
+        gp: Optional[Shard] = None
+
+        # Collect available shards
         for idx_str, holders in self.shard_map[file_id].items():
-            idx = int(idx_str)
+            try:
+                idx = int(idx_str)
+            except ValueError:
+                self.logs.append(self._stamp(f"[WARN] Malformed shard index key: {idx_str}"))
+                continue
+
             shard = self._fetch_valid_shard(file_id, idx, holders)
             if shard:
-                if shard.kind == "data": collected[idx] = shard
-                elif shard.kind == "local_parity": available_local[shard.group_id] = shard
-                elif shard.kind == "global_parity": gp = shard
-            elif idx < num_data:
-                missing.append(idx)
-        
-        if missing:
-            groups = {gid: [i for i in range(num_data) if i // group_size == gid] for gid in range(meta["num_local_parity"])}
-            for gid, members in groups.items():
-                missing_in_group = [i for i in members if i in missing]
-                if len(missing_in_group) == 1 and gid in available_local:
-                    miss_idx = missing_in_group[0]
-                    present_data = [collected[i].data for i in members if i in collected]
-                    repaired_data = self._xor_bytes([available_local[gid].data] + present_data)
-                    collected[miss_idx] = Shard.make(file_id, miss_idx, num_data, repaired_data.rstrip(b'\0'), "data")
-                    missing.remove(miss_idx)
-                    self.logs.append(self._stamp(f"[REPAIR-LOCAL] Shard {miss_idx} of '{file_id}'"))
-        
+                if shard.kind == "data":
+                    collected[idx] = shard
+                elif shard.kind == "local_parity":
+                    gid = shard.group_id if shard.group_id is not None else (idx - num_data)
+                    available_local[gid] = shard
+                elif shard.kind == "global_parity":
+                    gp = shard
+            else:
+                if idx < num_data:
+                    missing.append(idx)
+
+        if len(collected) == 0 and not available_local and not gp:
+            raise MissingShardsError(missing, details="No available shards or parity to attempt reconstruction.")
+
+        # Repair missing shards using local parity
+        groups = {gid: [i for i in range(num_data) if i // group_size == gid] for gid in range(meta.get("num_local_parity", 0))}
+        for gid, members in groups.items():
+            missing_in_group = [i for i in members if i in missing]
+            if len(missing_in_group) == 1 and gid in available_local:
+                miss_idx = missing_in_group[0]
+                present_data = [collected[i].data for i in members if i in collected]
+                repaired_data = self._xor_bytes([available_local[gid].data] + present_data)
+                if shard_sizes and len(shard_sizes) > miss_idx:
+                    target_len = shard_sizes[miss_idx]
+                    repaired_trimmed = repaired_data[:target_len]
+                elif original_size is not None:
+                    base, extra = divmod(original_size, num_data)
+                    size = base + (1 if miss_idx < extra else 0)
+                    repaired_trimmed = repaired_data[:size]
+                else:
+                    repaired_trimmed = repaired_data
+                collected[miss_idx] = Shard.make(file_id, miss_idx, num_data, repaired_trimmed, "data")
+                missing.remove(miss_idx)
+                self.logs.append(self._stamp(f"[REPAIR-LOCAL] Shard {miss_idx} of '{file_id}' using local parity gid={gid}"))
+
+        # Repair last missing shard using global parity
         if len(missing) == 1 and gp:
             miss_idx = missing[0]
             present_data = [collected[i].data for i in range(num_data) if i in collected]
             repaired_data = self._xor_bytes([gp.data] + present_data)
-            collected[miss_idx] = Shard.make(file_id, miss_idx, num_data, repaired_data.rstrip(b'\0'), "data")
+            if shard_sizes and len(shard_sizes) > miss_idx:
+                target_len = shard_sizes[miss_idx]
+                repaired_trimmed = repaired_data[:target_len]
+            elif original_size is not None:
+                base, extra = divmod(original_size, num_data)
+                size = base + (1 if miss_idx < extra else 0)
+                repaired_trimmed = repaired_data[:size]
+            else:
+                repaired_trimmed = repaired_data
+            collected[miss_idx] = Shard.make(file_id, miss_idx, num_data, repaired_trimmed, "data")
             missing.clear()
-            self.logs.append(self._stamp(f"[REPAIR-GLOBAL] Shard {miss_idx} of '{file_id}'"))
+            self.logs.append(self._stamp(f"[REPAIR-GLOBAL] Shard {miss_idx} of '{file_id}' using global parity"))
 
-        if missing: raise RuntimeError(f"Unrecoverable shards: {sorted(missing)}")
-        
-        return b"".join(collected[i].data for i in sorted(collected.keys()) if i < num_data)
+        if missing:
+            detail_lines = []
+            for m in sorted(missing):
+                holders = self.shard_map[file_id].get(str(m), [])
+                detail_lines.append(f"{m}: holders={holders}")
+            detail = "; ".join(detail_lines)
+            raise MissingShardsError(missing, details=detail)
 
+        for i in range(num_data):
+            if i not in collected:
+                raise ReconstructionError(f"Inconsistent state: shard {i} missing after repair attempts")
+
+        # Assemble final file
+        full = b"".join(collected[i].data for i in range(num_data))
+        if original_size is not None:
+            return full[:original_size]
+        return full
+
+    # Fetch valid shard with checksum verification
     def _fetch_valid_shard(self, file_id: str, index: int, holders: List[str]) -> Optional[Shard]:
+        corrupt_locations = []
+        absent_locations = []
         for nid in holders:
             node = self.nodes.get(nid)
-            if node and node.online:
-                shard = node.get_shard(file_id, index)
-                if shard and hashlib.sha256(shard.data).hexdigest() == shard.checksum:
-                    return shard
-                elif shard: self.logs.append(self._stamp(f"[CORRUPT] Shard {index} on {nid}"))
+            if not node:
+                absent_locations.append((nid, "unknown_node"))
+                continue
+            if not node.online:
+                absent_locations.append((nid, "offline"))
+                continue
+            shard = node.get_shard(file_id, index)
+            if shard is None:
+                absent_locations.append((nid, "no_shard"))
+                continue
+            actual = hashlib.sha256(shard.data).hexdigest()
+            if actual == shard.checksum:
+                return shard
+            else:
+                corrupt_locations.append((index, nid))
+                self.logs.append(self._stamp(f"[CORRUPT] Shard {index} on {nid} (expected {shard.checksum[:8]} got {actual[:8]})"))
+        if corrupt_locations:
+            self.logs.append(self._stamp(f"[FETCH] No valid shard {index}; corrupt copies at {corrupt_locations}; absent/ offline at {absent_locations}"))
+        else:
+            self.logs.append(self._stamp(f"[FETCH] No shard {index} available from holders; absent/ offline at {absent_locations}"))
         return None
 
+    # Restore missing shards on a node
     def heal_node(self, node_id: str):
         if not self.nodes.get(node_id, None) or not self.nodes[node_id].online: return
         node, repaired = self.nodes[node_id], 0
@@ -263,6 +391,7 @@ class ShardManager:
                             self.logs.append(self._stamp(f"[HEAL-FAIL] on {node_id} for shard {idx}: {e}"))
         self.logs.append(self._stamp(f"[HEAL] Node {node_id} finished. Restored {repaired} shards."))
 
+    # Display shard distribution matrix
     def print_matrix(self, file_id: str):
         if file_id not in self.shard_map:
             typer.echo(f"File ID '{file_id}' not found in system.")
@@ -292,10 +421,12 @@ class ShardManager:
         typer.echo("="*30)
         self.logs.clear()
 
+    # Add timestamp to log message
     @staticmethod
     def _stamp(msg: str) -> str:
         return f"[{time.strftime('%H:%M:%S')}] {msg}"
 
+    # Save system state to JSON
     def save_state(self, filepath: Path):
         data = {"nodes": {nid: n.to_dict() for nid, n in self.nodes.items()},
                 "shard_map": self.shard_map, "file_meta": self.file_meta,
@@ -303,6 +434,7 @@ class ShardManager:
                 "use_global_parity": self.use_global_parity}
         filepath.write_text(json.dumps(data, indent=2))
 
+    # Load system state from JSON
     @classmethod
     def load_state(cls, filepath: Path) -> "ShardManager":
         data = json.loads(filepath.read_text())
@@ -312,9 +444,7 @@ class ShardManager:
         manager.file_meta = data.get("file_meta", {})
         return manager
 
-
-# ---------- CLI Application ----------
-
+# CLI application
 app = typer.Typer(help="A CLI for simulating a fault-tolerant Orbital Sharded Storage system.")
 
 def load_manager(state_file: Path) -> ShardManager:
@@ -330,6 +460,7 @@ def save_manager(manager: ShardManager, state_file: Path):
     manager.print_logs()
     typer.echo(f"✅ State saved to '{state_file}'")
 
+# Initialize storage system with nodes
 @app.command()
 def init(
     state_file: Path = typer.Option(..., "--state-file", "-f", help="Path to save the initial state file."),
@@ -338,14 +469,15 @@ def init(
     group_size: int = typer.Option(3, "--group-size", help="Number of data shards per local parity group."),
     global_parity: bool = typer.Option(True, help="Whether to use a global parity shard.")
 ):
-    """Initializes a new storage system with a set of nodes."""
-    random.seed(42) # Ensure deterministic node placement for demos
+    
+    random.seed(42)
     manager = ShardManager(repl_factor, group_size, global_parity)
     for i in range(num_nodes):
         manager.add_node(Node(f"SAT-{i}"))
     typer.echo(f"Initialized system with {num_nodes} nodes.")
     save_manager(manager, state_file)
 
+# Display system status
 @app.command()
 def status(
     state_file: Path = typer.Option(..., "--state-file", "-f", help="Path to the state file to inspect."),
@@ -359,6 +491,7 @@ def status(
     if file_id:
         manager.print_matrix(file_id)
 
+# Distribute file into sharded storage
 @app.command()
 def distribute(
     state_file: Path = typer.Option(..., "--state-file", "-f", help="Path to the system state file (will be updated)."),
@@ -381,13 +514,14 @@ def distribute(
         typer.echo(f"Error distributing file: {e}")
         raise typer.Exit(code=1)
 
+# Reconstruct file from shards
 @app.command()
 def reconstruct(
     state_file: Path = typer.Option(..., "--state-file", "-f", help="Path to the system state file."),
     file_id: str = typer.Argument(..., help="The ID of the file to reconstruct."),
     output_file: Path = typer.Argument(..., help="Path to save the reconstructed file.")
 ):
-    """Reconstructs a file from the system and saves it locally."""
+   
     manager = load_manager(state_file)
     try:
         reconstructed_bytes = manager.reconstruct_file(file_id)
@@ -395,22 +529,22 @@ def reconstruct(
         manager.print_logs()
         typer.echo(f"✅ File '{file_id}' reconstructed successfully and saved to '{output_file}'")
         
-        # Integrity check
         original_hash = hashlib.sha256(reconstructed_bytes).hexdigest()
         typer.echo(f"Reconstructed file SHA-256: {original_hash}")
 
-    except (KeyError, RuntimeError) as e:
+    except (KeyError, RuntimeError, MissingShardsError, CorruptShardError, ReconstructionError) as e:
         manager.print_logs()
         typer.echo(f"Error reconstructing file: {e}")
         raise typer.Exit(code=1)
 
+# Set node online/offline status
 @app.command("set-status")
 def set_node_status(
     state_file: Path = typer.Option(..., "--state-file", "-f", help="Path to the system state file (will be updated)."),
     node_id: str = typer.Argument(..., help="The ID of the node to update (e.g., 'SAT-1')."),
     online: bool = typer.Argument(..., help="The new status: 'True' for online, 'False' for offline.")
 ):
-    """Sets a node's status to online or offline to simulate failures."""
+   
     manager = load_manager(state_file)
     try:
         manager.set_node_status(node_id, online)
@@ -419,12 +553,13 @@ def set_node_status(
         typer.echo(f"Error: {e}")
         raise typer.Exit(code=1)
 
+# Heal node by restoring missing shards
 @app.command()
 def heal(
     state_file: Path = typer.Option(..., "--state-file", "-f", help="Path to the system state file (will be updated)."),
     node_id: str = typer.Argument(..., help="The ID of the online node to heal.")
 ):
-    """Heals a node, restoring any missing shards from the network."""
+   
     manager = load_manager(state_file)
     if node_id not in manager.nodes or not manager.nodes[node_id].online:
         typer.echo(f"Error: Cannot heal node '{node_id}'. It is either unknown or offline.")
@@ -432,6 +567,27 @@ def heal(
     
     manager.heal_node(node_id)
     save_manager(manager, state_file)
+    # inside your main script
+    
+    
+    
+from pathlib import Path
+# import the run_dashboard function from the dashboard module we created
+from oss_dashboard import run_dashboard
+
+@app.command()
+def dashboard(
+    state_file: Path = typer.Option(..., "--state-file", "-f", help="Path to the state file to load."),
+    host: str = typer.Option("127.0.0.1", "--host", "-h", help="Host to bind the dashboard to."),
+    port: int = typer.Option(5000, "--port", "-p", help="Port to serve the dashboard on."),
+):
+    """
+    Run the web dashboard for the current ShardManager state (blocking).
+    """
+    manager = load_manager(state_file)
+    # This will block and run Flask; use CTRL+C to stop
+    run_dashboard(manager, host=host, port=port, debug=False)
+
 
 if __name__ == "__main__":
     app()
