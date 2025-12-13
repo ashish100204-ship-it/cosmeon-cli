@@ -567,27 +567,5 @@ def heal(
     
     manager.heal_node(node_id)
     save_manager(manager, state_file)
-    # inside your main script
-    
-    
-    
-from pathlib import Path
-# import the run_dashboard function from the dashboard module we created
-from oss_dashboard import run_dashboard
-
-@app.command()
-def dashboard(
-    state_file: Path = typer.Option(..., "--state-file", "-f", help="Path to the state file to load."),
-    host: str = typer.Option("127.0.0.1", "--host", "-h", help="Host to bind the dashboard to."),
-    port: int = typer.Option(5000, "--port", "-p", help="Port to serve the dashboard on."),
-):
-    """
-    Run the web dashboard for the current ShardManager state (blocking).
-    """
-    manager = load_manager(state_file)
-    # This will block and run Flask; use CTRL+C to stop
-    run_dashboard(manager, host=host, port=port, debug=False)
-
-
 if __name__ == "__main__":
     app()
